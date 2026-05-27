@@ -25,9 +25,13 @@ DATA_DIR  = f"f1_data_{YEAR}"
 DB_PATH   = f"{DATA_DIR}/database.csv"
 CACHE_DIR = "f1_cache"
 
-os.makedirs(DATA_DIR,  exist_ok=True)
-os.makedirs(CACHE_DIR, exist_ok=True)
-fastf1.Cache.enable_cache(CACHE_DIR)
+
+# Physical sanity caps — these are F1 laws, not arbitrary constants
+# No modern F1 car has ever been >5s off pole in qualifying
+# No F1 car has ever topped 400 km/h in race conditions
+QUALI_GAP_MAX_S  = 5.0
+TOP_SPEED_MAX_KMH = 400.0
+
 
 
 # ── telemetry helpers ──────────────────────────────────────────────────────────
@@ -55,14 +59,17 @@ def _corner_speed(lap) -> float:
 
 
 def _quali_gap(sess_q, abbr: str) -> float:
-    """Gap in seconds to the fastest Q lap. NaN if no time set."""
+    """Gap in seconds to the fastest Q lap. NaN if no time set or gap is corrupt."""
     try:
         laps     = sess_q.laps.pick_driver(abbr).pick_quicklaps()
         if laps.empty:
             return np.nan
         best     = laps["LapTime"].min().total_seconds()
         pole     = sess_q.laps.pick_quicklaps()["LapTime"].min().total_seconds()
-        return round(best - pole, 3)
+        gap      = round(best - pole, 3)
+        # Sanity cap: anything above 5.0s is physically impossible in F1 quali
+        # (slowest car is always within ~4s of pole). Flag as NaN.
+        return gap if gap <= QUALI_GAP_MAX_S else np.nan
     except Exception:
         return np.nan
 

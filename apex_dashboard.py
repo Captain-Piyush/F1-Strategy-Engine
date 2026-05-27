@@ -75,7 +75,15 @@ def next_race_info():
     try:
         fastf1.Cache.enable_cache(CACHE_DIR)
         s  = fastf1.get_event_schedule(YEAR)
-        up = s[s["EventDate"] > pd.Timestamp.now()]
+        s  = s[~s["EventName"].str.contains("Testing", na=False)]
+        s["RaceDay"] = pd.to_datetime(s["EventDate"])
+        # Target: race day hasn't fully passed (give 6hr buffer after race)
+        up = s[s["RaceDay"] > pd.Timestamp.now() - pd.Timedelta(hours=6)]
+        # Also filter out rounds already in database
+        db = load_database()
+        if db is not None:
+            done = set(db["Round"].unique())
+            up   = up[~up["RoundNumber"].astype(int).isin(done)]
         return up.iloc[0] if not up.empty else None
     except Exception:
         return None
@@ -162,7 +170,23 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 # ══════════════════════════════════════════════════════════════════════════════
 with tab1:
     if pred is None:
-        st.warning("Run `python apex_predict.py` first.")
+        st.warning("No predictions yet.")
+        if st.button("🏎 Get Prediction for Next Race", type="primary", use_container_width=True):
+            with st.spinner("Running prediction engine..."):
+                try:
+                    import subprocess, sys
+                    result = subprocess.run(
+                        [sys.executable, "apex_predict.py"],
+                        capture_output=True, text=True, timeout=600
+                    )
+                    st.cache_data.clear()
+                    if result.returncode == 0:
+                        st.success("Done! Prediction ready.")
+                        st.rerun()
+                    else:
+                        st.error(f"Error:\n{result.stderr[-800:]}")
+                except Exception as e:
+                    st.error(str(e))
     else:
         race_title = pred["Next_Race"].iloc[0] if "Next_Race" in pred.columns else "Next Race"
         st.header(f"🏁 {race_title}")
@@ -241,28 +265,41 @@ with tab2:
     if pred is None:
         st.warning("No predictions loaded.")
     else:
-        signal_cols = [c for c in ["History","Form","Quali","Physics","Reliability"]
+        # Show weekend state
+        state = pred["Weekend_State"].iloc[0] if "Weekend_State" in pred.columns else "Unknown"
+        state_colors = {
+            "PRE_WEEKEND": "🟡 Pre-Weekend (using historical + season data)",
+            "POST_FP2"   : "🟠 Post-FP2 (practice pace included)",
+            "POST_QUALI" : "🟢 Post-Qualifying (actual grid position included)",
+            "RACE_DAY"   : "🏁 Race Day (full signal suite)",
+        }
+        st.info(state_colors.get(state, state))
+
+        signal_cols = [c for c in ["DNA_Sig","Mom_Sig","Skl_Sig","Qua_Sig"]
                        if c in pred.columns]
-        if not signal_cols:
-            st.info("Signal breakdown columns not in predictions CSV. "
-                    "Re-run apex_predict.py to generate them.")
-        else:
+        labels = {
+            "DNA_Sig": "Track DNA match",
+            "Mom_Sig": "Momentum",
+            "Skl_Sig": "Driver skill",
+            "Qua_Sig": "Qualifying pace",
+        }
+
+        if signal_cols:
             top_n = pred.head(12)
             fig_sig = go.Figure()
             sig_colors = {
-                "History"    : "#FF6B6B",
-                "Form"       : "#4ECDC4",
-                "Quali"      : "#45B7D1",
-                "Physics"    : "#96CEB4",
-                "Reliability": "#FFEAA7",
+                "DNA_Sig": "#45B7D1",
+                "Mom_Sig": "#FF6B6B",
+                "Skl_Sig": "#4ECDC4",
+                "Qua_Sig": "#96CEB4",
             }
             for sig in signal_cols:
-                if sig in top_n.columns:
-                    fig_sig.add_trace(go.Bar(
-                        name=sig, x=top_n["Driver"],
-                        y=top_n[sig],
-                        marker_color=sig_colors.get(sig, "#888"),
-                    ))
+                fig_sig.add_trace(go.Bar(
+                    name=labels.get(sig, sig),
+                    x=top_n["Driver"],
+                    y=top_n[sig],
+                    marker_color=sig_colors.get(sig, "#888"),
+                ))
             fig_sig.update_layout(
                 barmode="stack",
                 title="Signal contribution per driver (top 12)",
@@ -271,6 +308,8 @@ with tab2:
                 font=dict(color="white"), height=440,
             )
             st.plotly_chart(fig_sig, use_container_width=True)
+        else:
+            st.info("Re-run apex_predict.py to generate signal breakdown.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
