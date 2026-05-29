@@ -270,6 +270,10 @@ def build_features(db: pd.DataFrame) -> pd.DataFrame:
     db["Quali_Gap_EMA"] = db.groupby("Driver")["Quali_Gap_s"].transform(
         lambda x: x.ewm(span=4, adjust=False).mean())
 
+    # Team points EMA — car competitiveness signal (matches training schema)
+    db["Team_Pts_EMA"] = db.groupby("Team")["Points"].transform(
+        lambda x: x.ewm(span=4, adjust=False).mean())
+
     # ── MOMENTUM (recency-weighted position score) ─────────────────────────────
     # P1=1.0, P20=0.0. Last race 50%, -2 25%, -3 15%, -4 10%.
     # Rewards sustained excellence. ANT wins 4 straight → score ~1.0.
@@ -317,6 +321,10 @@ def build_features(db: pd.DataFrame) -> pd.DataFrame:
 
     db["Skill_Delta"] = db.groupby("Driver")["Skill_Raw"].transform(
         lambda x: x.ewm(span=5, adjust=False).mean())
+
+    # Grid percentile (matches training schema)
+    db["Grid_Pct"] = db.groupby("Round")["Grid"].rank(
+        pct=True, ascending=False).fillna(0.5)
 
     return db
 
@@ -757,28 +765,32 @@ def _ml_predict(model_pkg: dict, latest: pd.DataFrame,
         model    = model_pkg["model"]
         features = model_pkg["features"]
 
-        # Build feature vector matching training schema
+        # Build feature vector matching training schema EXACTLY
         ct_map = {"STREET": 2, "BALANCED": 1, "POWER": 0}
 
-        total_rounds = 24  # approximate full season
+        total_rounds = 24
         seas_prog    = n_rounds / total_rounds
+
+        # Year_Norm: normalise 2026 within 2018-2026 range
+        yr_min, yr_max = 2018, 2026
+        year_norm = (YEAR - yr_min) / (yr_max - yr_min + 1e-9)
 
         rows = []
         for _, row in latest.iterrows():
             rows.append({
-                "Circuit_Code"  : ct_map.get(circuit_type, 1),
-                "Reg_Era"       : 3,   # 2026 = most recent era
+                "Circuit_Code"   : ct_map.get(circuit_type, 1),
                 "Season_Progress": seas_prog,
-                "Grid"          : row.get("Grid", 10.0),
-                "Grid_Pct"      : row.get("Grid_Pct", 0.5)
-                                  if "Grid_Pct" in latest.columns else 0.5,
-                "Momentum"      : row.get("Momentum", 0.5),
-                "Elo_Norm"      : 0.0,  # will normalise below
-                "Skill_Delta"   : row.get("Skill_Delta", 0.0),
-                "Reliability"   : row.get("Reliability", 0.80),
-                "Quali_Gap_EMA" : row.get("Quali_Gap_EMA", 1.0),
-                "Points_EMA"    : row.get("Points_EMA", 0.0)
-                                  if "Points_EMA" in latest.columns else 0.0,
+                "Year_Norm"      : year_norm,
+                "Grid"           : float(row.get("Grid", 10.0) or 10.0),
+                "Grid_Pct"       : float(row.get("Grid_Pct", 0.5) or 0.5),
+                "Momentum"       : float(row.get("Momentum", 0.5) or 0.5),
+                "Elo_Norm"       : 0.0,  # computed below
+                "Skill_Delta"    : float(row.get("Skill_Delta", 0.0) or 0.0),
+                "Reliability"    : float(row.get("Reliability", 0.80) or 0.80),
+                "Quali_Gap_EMA"  : float(row.get("Quali_Gap_EMA", 1.0) or 1.0),
+                "Team_Pts_EMA"   : float(row.get("Team_Pts_EMA", 0.0)
+                                   if "Team_Pts_EMA" in latest.columns
+                                   else row.get("Points_EMA", 0.0) or 0.0),
             })
 
         feat_df = pd.DataFrame(rows)
@@ -957,12 +969,21 @@ def predict():
         ml_probs = _ml_predict(model_pkg, latest, track, n_rounds, circuit_type)
 
     if ml_probs is not None:
+        # Blend ratio — conservative early season, reduced for street circuits.
+        # ML model trained on all circuits equally, doesn't know Monaco's
+        # "qualifying position locks the race" constraint.
+        # Signal engine handles circuit-specific logic better early on.
         if n_rounds < 5:
-            ml_w = 0.30
+            ml_w = 0.20
         elif n_rounds < 10:
-            ml_w = 0.50
+            ml_w = 0.35
         else:
-            ml_w = 0.70
+            ml_w = 0.60
+
+        # Street circuits: signal engine knows Monaco/Singapore/Baku
+        # dynamics better than the ML model at this training data volume
+        if circuit_type == "STREET":
+            ml_w = max(0.15, ml_w - 0.15)
 
         sig_w = 1.0 - ml_w
         probs = ml_w * ml_probs + sig_w * signal_probs

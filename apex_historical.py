@@ -2,17 +2,23 @@
 APEX PREDATOR — apex_historical.py
 =====================================
 One-time historical data fetcher. Pulls 2018-2025 race data from FastF1.
-No telemetry — just results, qualifying times, and grid positions.
-This keeps the cache under 500MB and runs in 20-30 minutes.
+No telemetry — just results and qualifying times.
+
+Handles FastF1's 500 calls/hour rate limit automatically:
+  - Catches RateLimitExceededError
+  - Waits 65 seconds then retries
+  - Up to 5 retries per race
 
 Run once: python apex_historical.py
 Output: f1_data_historical/historical_database.csv
+Resumable: already-fetched races are skipped automatically.
 """
 
 import fastf1
 import pandas as pd
 import numpy as np
 import os
+import time
 import warnings
 from datetime import datetime
 
@@ -21,11 +27,9 @@ warnings.filterwarnings("ignore")
 CACHE_DIR   = "f1_cache"
 OUTPUT_DIR  = "f1_data_historical"
 OUTPUT_PATH = f"{OUTPUT_DIR}/historical_database.csv"
+YEARS       = list(range(2018, 2026))
 
-# Years to fetch. 2018 = first year FastF1 has reliable data.
-YEARS = list(range(2018, 2026))
-
-# Physical sanity cap on qualifying gap
+# Physical sanity cap
 QUALI_GAP_MAX_S = 5.0
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -44,19 +48,18 @@ def _finished(status: str) -> int:
 
 
 def _dnf_type(status: str) -> str:
-    """Classify DNF as mechanical, driver, or none."""
     if pd.isna(status):
         return "none"
     s = str(status).lower()
-    if any(w in s for w in ["retired", "did not start", "power", "gearbox",
-                             "engine", "hydraulic", "electrical", "mechanical",
-                             "brake", "suspension", "exhaust", "fuel"]):
+    if any(w in s for w in ["retired","did not start","power","gearbox",
+                             "engine","hydraulic","electrical","mechanical",
+                             "brake","suspension","exhaust","fuel"]):
         return "mechanical"
-    if any(w in s for w in ["accident", "collision", "spin", "damage"]):
+    if any(w in s for w in ["accident","collision","spin","damage"]):
         return "driver"
     if "finished" in s or "lapped" in s or "+" in s:
         return "none"
-    return "mechanical"  # default unknown retirement to mechanical
+    return "mechanical"
 
 
 def _quali_gap(sess_q, abbr: str) -> float:
@@ -74,29 +77,44 @@ def _quali_gap(sess_q, abbr: str) -> float:
 
 def _circuit_type(event_name: str) -> str:
     name = event_name.lower()
-    street_kw = ["monaco", "singapore", "baku", "azerbaijan",
-                 "las vegas", "saudi", "jeddah"]
-    power_kw  = ["monza", "italian", "spa", "belgian",
-                 "canadian", "montreal"]
-    if any(k in name for k in street_kw):
+    if any(k in name for k in ["monaco","singapore","baku","azerbaijan",
+                                "las vegas","saudi","jeddah"]):
         return "street"
-    if any(k in name for k in power_kw):
+    if any(k in name for k in ["monza","italian","spa","belgian",
+                                "canadian","montreal"]):
         return "power"
     return "balanced"
 
 
-# ── regulation era encoder ─────────────────────────────────────────────────────
-# F1 has had distinct regulation eras that affect car performance relationships.
-# We encode this so the model can discount older data appropriately.
 def _reg_era(year: int) -> int:
     if year <= 2021:
-        return 0   # hybrid V6 + old aero
-    elif year <= 2021:
-        return 1   # transitional
+        return 0
     elif year <= 2023:
-        return 2   # ground effect era begins (2022 regs)
+        return 2
     else:
-        return 3   # evolved ground effect (2024-2026 similar)
+        return 3
+
+
+def _load_session_with_retry(year, event_name, session_type,
+                              max_retries=5, wait_s=70):
+    """
+    Loads a FastF1 session with automatic rate limit recovery.
+    Waits wait_s seconds when rate limit is hit, then retries.
+    """
+    for attempt in range(max_retries):
+        try:
+            sess = fastf1.get_session(year, event_name, session_type)
+            sess.load(telemetry=False, weather=False, messages=False)
+            return sess
+        except fastf1.RateLimitExceededError:
+            if attempt < max_retries - 1:
+                print(f"\n║    ⚠ Rate limit hit — waiting {wait_s}s "
+                      f"(attempt {attempt+1}/{max_retries})", flush=True)
+                time.sleep(wait_s)
+            else:
+                raise
+        except Exception as e:
+            raise e
 
 
 # ── main ───────────────────────────────────────────────────────────────────────
@@ -108,17 +126,15 @@ def fetch_historical():
 
     # Load existing to allow resume
     if os.path.exists(OUTPUT_PATH):
-        existing = pd.read_csv(OUTPUT_PATH)
-        done_keys = set(
-            zip(existing["Year"].astype(str),
-                existing["Round"].astype(str))
-        )
+        existing  = pd.read_csv(OUTPUT_PATH)
+        done_keys = set(zip(existing["Year"].astype(str),
+                            existing["Round"].astype(str)))
         print(f"║  Resuming — {len(done_keys)} race-rounds already stored\n")
     else:
         existing  = pd.DataFrame()
         done_keys = set()
 
-    all_rows = []
+    all_rows    = []
     total_races = 0
     failed      = 0
 
@@ -139,23 +155,24 @@ def fetch_historical():
             key       = (str(year), str(rnd))
 
             if key in done_keys:
+                print(f"║    Round {rnd:>2}: {race_name} ... already stored")
                 continue
 
             print(f"║    Round {rnd:>2}: {race_name}", end=" ... ", flush=True)
 
             try:
-                # Race session — no telemetry
-                sess_r = fastf1.get_session(year, event["EventName"], "R")
-                sess_r.load(telemetry=False, weather=False, messages=False)
+                # Race session with rate limit retry
+                sess_r = _load_session_with_retry(
+                    year, event["EventName"], "R")
 
                 if sess_r.results is None or sess_r.results.empty:
                     print("no results")
                     continue
 
-                # Qualifying — no telemetry
+                # Qualifying session with rate limit retry
                 try:
-                    sess_q = fastf1.get_session(year, event["EventName"], "Q")
-                    sess_q.load(telemetry=False, weather=False, messages=False)
+                    sess_q = _load_session_with_retry(
+                        year, event["EventName"], "Q")
                     has_q  = True
                 except Exception:
                     sess_q = None
@@ -168,17 +185,14 @@ def fetch_historical():
                 for _, drv in results.iterrows():
                     abbr   = drv["Abbreviation"]
                     status = str(drv["Status"])
-                    fin    = _finished(status)
-                    dnf_t  = _dnf_type(status)
                     pos    = drv["Position"]
+                    grid   = drv["GridPosition"]
 
                     try:
                         pos = float(pos)
                     except Exception:
                         pos = np.nan
 
-                    qgap = _quali_gap(sess_q, abbr) if has_q else np.nan
-                    grid = drv["GridPosition"]
                     try:
                         grid = float(grid)
                         if grid <= 0:
@@ -187,49 +201,55 @@ def fetch_historical():
                         grid = np.nan
 
                     all_rows.append({
-                        "Year"         : year,
-                        "Round"        : rnd,
-                        "Race"         : race_name,
-                        "Circuit_Type" : circ,
-                        "Reg_Era"      : era,
-                        "Driver"       : abbr,
-                        "Team"         : drv["TeamName"],
-                        "Grid"         : grid,
-                        "Finish"       : pos,
-                        "Status"       : status,
-                        "Finished"     : fin,
-                        "DNF_Type"     : dnf_t,
-                        "Points"       : drv["Points"],
-                        "Quali_Gap_s"  : qgap,
+                        "Year"        : year,
+                        "Round"       : rnd,
+                        "Race"        : race_name,
+                        "Circuit_Type": circ,
+                        "Reg_Era"     : era,
+                        "Driver"      : abbr,
+                        "Team"        : drv["TeamName"],
+                        "Grid"        : grid,
+                        "Finish"      : pos,
+                        "Status"      : status,
+                        "Finished"    : _finished(status),
+                        "DNF_Type"    : _dnf_type(status),
+                        "Points"      : drv["Points"],
+                        "Quali_Gap_s" : _quali_gap(sess_q, abbr) if has_q
+                                        else np.nan,
                     })
 
                 total_races += 1
                 print(f"✓ {len(results)} drivers")
 
+                # Save incrementally every 5 races so crashes don't lose data
+                if total_races % 5 == 0 and all_rows:
+                    _save(existing, all_rows)
+                    print(f"║    [Auto-saved at {total_races} new races]")
+
+            except fastf1.RateLimitExceededError:
+                failed += 1
+                print(f"✗ rate limit exhausted after retries — skipping")
             except Exception as e:
                 failed += 1
                 print(f"✗ {e}")
 
-    # Combine with existing
+    # Final save
     if all_rows:
-        new_df   = pd.DataFrame(all_rows)
-        final_df = pd.concat([existing, new_df], ignore_index=True)
+        _save(existing, all_rows)
 
-        # Sanity: remove duplicate year+round+driver rows
-        final_df = final_df.drop_duplicates(
-            subset=["Year","Round","Driver"], keep="last")
-
-        # Sort chronologically
-        final_df = final_df.sort_values(
-            ["Year","Round","Finish"]).reset_index(drop=True)
-
-        final_df.to_csv(OUTPUT_PATH, index=False)
-        print(f"\n║  ✓ Saved {len(final_df)} rows → {OUTPUT_PATH}")
-        print(f"║  Races fetched: {total_races} | Failed: {failed}")
-    else:
-        print("\n║  No new data fetched.")
-
+    print(f"\n║  Races fetched: {total_races} | Failed: {failed}")
     print("╚══════════════════════════╝")
+
+
+def _save(existing: pd.DataFrame, new_rows: list):
+    new_df   = pd.DataFrame(new_rows)
+    final_df = pd.concat([existing, new_df], ignore_index=True)
+    final_df = final_df.drop_duplicates(
+        subset=["Year","Round","Driver"], keep="last")
+    final_df = final_df.sort_values(
+        ["Year","Round","Finish"]).reset_index(drop=True)
+    final_df.to_csv(OUTPUT_PATH, index=False)
+    print(f"║  ✓ Saved {len(final_df)} rows → {OUTPUT_PATH}")
 
 
 if __name__ == "__main__":
