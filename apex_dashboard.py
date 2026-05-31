@@ -1,15 +1,7 @@
 """
-APEX PREDATOR — apex_dashboard.py
-===================================
-Streamlit pit wall dashboard.
+PITWALL — F1 Strategy Intelligence Dashboard
+=============================================
 Run: streamlit run apex_dashboard.py
-
-Tabs:
-  1. Live Prediction    — Win%, Podium%, Points EV with CI error bars
-  2. Signal Breakdown   — per-driver contribution from each signal
-  3. Physics Matrix     — Speed vs Cornering scatter
-  4. Driver Form        — ELO trajectory + form EMA over season
-  5. Post-Race Validator — prediction vs reality accuracy
 """
 
 import streamlit as st
@@ -19,13 +11,22 @@ import plotly.graph_objects as go
 import plotly.express as px
 import fastf1
 import os
+import sys
 import warnings
 from datetime import datetime
 
 warnings.filterwarnings("ignore")
 
+# Fix Windows Unicode encoding
+if sys.platform == "win32":
+    import io
+    sys.stdout = io.TextIOWrapper(
+        sys.stdout.buffer, encoding="utf-8", errors="replace")
+
+N_SIMS = 50_000
+
 st.set_page_config(
-    page_title="APEX PREDATOR — F1 Strategy Engine",
+    page_title="PITWALL — F1 Strategy Intelligence",
     page_icon="🏎",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -105,8 +106,8 @@ def fetch_real_results(race_name: str):
 # ── sidebar ───────────────────────────────────────────────────────────────────
 
 with st.sidebar:
-    st.markdown("## 🏎 APEX PREDATOR")
-    st.caption(f"F1 Strategy Engine · {YEAR}")
+    st.markdown("## PITWALL")
+    st.caption(f"F1 Strategy Intelligence · {YEAR}")
     st.divider()
 
     nr = next_race_info()
@@ -140,7 +141,8 @@ with st.sidebar:
                 import subprocess, sys
                 result = subprocess.run(
                     [sys.executable, "apex_predict.py"],
-                    capture_output=True, text=True, timeout=600
+                    capture_output=True, text=True, timeout=600,
+                    env={**os.environ, "PYTHONIOENCODING": "utf-8"}
                 )
                 st.cache_data.clear()
                 if result.returncode == 0:
@@ -513,10 +515,7 @@ with tab5:
 # ── footer ────────────────────────────────────────────────────────────────────
 st.divider()
 st.caption(
-    f"APEX PREDATOR · {YEAR} · "
+    f"PITWALL · F1 Strategy Intelligence · {YEAR} · "
     f"FastF1 + FIA Telemetry · "
-    f"Monte Carlo {N_SIMS:,} iterations · "
-    f"5-signal ensemble"
+    f"LightGBM + Monte Carlo {N_SIMS:,} iterations"
 )
-
-N_SIMS = 50_000
