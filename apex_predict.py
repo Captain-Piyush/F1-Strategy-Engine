@@ -320,7 +320,11 @@ def build_features(db: pd.DataFrame) -> pd.DataFrame:
     db.loc[team_size < 2, "Skill_Raw"] = 0.0
 
     db["Skill_Delta"] = db.groupby("Driver")["Skill_Raw"].transform(
-        lambda x: x.ewm(span=5, adjust=False).mean())
+        lambda x: x.ewm(span=10, adjust=False).mean())
+
+    # Cap skill delta at ±3 positions — prevents one chaotic race
+    # (Monaco HAM P2 with penalty, LEC DNF crash) from dominating
+    db["Skill_Delta"] = db["Skill_Delta"].clip(-3.0, 3.0)
 
     # Grid percentile (matches training schema)
     db["Grid_Pct"] = db.groupby("Round")["Grid"].rank(
